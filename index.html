@@ -2520,10 +2520,14 @@ function updateParts(dt) {
 //    looks ahead for rock, and keeps clear of black holes and armed mines
 //  · combat: leads its shots, holds a stand-off distance and circles, uses missiles / mines / shield
 //  · goals: hunt the opponent, fetch crates, go home to repair when the hull is low
+// react: s before it opens fire · aimErr: how far its aim wanders (rad) · fireTol: how loosely it judges "lined up"
+// lead: how much it aims ahead · range: longest shot it takes · slop: steering dead zone (rad, bigger = sloppier)
+// look: how far ahead it watches for rock · lapse: chance per second of a careless moment (stops watching for rock,
+// speeds up) lasting lapseLen s - that is how it ends up clipping walls now and then
 const CPU_LEVELS = [
-  { name: 'Easy',   react: 0.5,  aimErr: 0.16, fireTol: 0.16, lead: 0.35, speed: 250, think: 0.4,  items: 0.45, retreat: 0.22 },
-  { name: 'Normal', react: 0.25, aimErr: 0.07, fireTol: 0.1,  lead: 0.8,  speed: 340, think: 0.25, items: 0.85, retreat: 0.33 },
-  { name: 'Hard',   react: 0.1,  aimErr: 0.025, fireTol: 0.07, lead: 1,    speed: 440, think: 0.15, items: 1,    retreat: 0.4 },
+  { name: 'Easy',   react: 0.8,  aimErr: 0.3,  fireTol: 0.24, lead: 0.15, range: 420, speed: 240, think: 0.45, items: 0.3,  retreat: 0.2,  slop: 0.13,  look: 0.5,  lapse: 0.2,  lapseLen: 1 },
+  { name: 'Normal', react: 0.45, aimErr: 0.16, fireTol: 0.15, lead: 0.5,  range: 560, speed: 310, think: 0.3,  items: 0.65, retreat: 0.3,  slop: 0.07,  look: 0.9,  lapse: 0.04, lapseLen: 0.8 },
+  { name: 'Hard',   react: 0.22, aimErr: 0.08, fireTol: 0.1,  lead: 0.85, range: 680, speed: 390, think: 0.2,  items: 0.9,  retreat: 0.36, slop: 0.04,  look: 1,    lapse: 0.012, lapseLen: 0.6 },
 ];
 let gameMode = 'pvp', cpuLevel = 1;
 try {
@@ -2531,7 +2535,7 @@ try {
   const lv = localStorage.getItem('cave-flight-cpu'); if (lv !== null) cpuLevel = Math.min(2, Math.max(0, +lv | 0));
 } catch (e) {}
 const newAi = () => ({ keys: { left: false, right: false, thrust: false, fire: false, mine: false }, thinkT: 0, wpT: 0, wp: null,
-  goal: 'hunt', tx: 0, ty: 0, seen: 0, err: 0, orbit: Math.random() < 0.5 ? 1 : -1, orbitT: 3, secCd: 1, shieldT: 0, lastFire: false, stuckT: 0 });
+  goal: 'hunt', tx: 0, ty: 0, seen: 0, err: 0, errTo: 0, errT: 0, lapseT: 0, orbit: Math.random() < 0.5 ? 1 : -1, orbitT: 3, secCd: 1, shieldT: 0, lastFire: false, stuckT: 0 });
 
 const NAV = 16, NDX = [1, -1, 0, 0, 1, 1, -1, -1], NDY = [0, 0, 1, -1, 1, -1, 1, -1];
 let navW = 0, navH = 0, navOpen = null, navDist = null, navQ = null, navDirty = false;
@@ -2645,6 +2649,10 @@ function updateCpu(p, dt) {
   else if ((ai.wpT -= dt) <= 0) { ai.wp = navWaypoint(p); ai.wpT = 0.1; }
   if ((ai.orbitT -= dt) <= 0) { ai.orbitT = 2 + Math.random() * 3; if (Math.random() < 0.5) ai.orbit = -ai.orbit; }
 
+  // careless moments: stops watching for rock and pushes a bit faster (mostly on Easy)
+  if (ai.lapseT > 0) ai.lapseT -= dt;
+  else if (Math.random() < L.lapse * dt) ai.lapseT = L.lapseLen * (0.6 + Math.random() * 0.8);
+  const careless = ai.lapseT > 0;
   // 1) the velocity it would like to have
   let dvx = 0, dvy = 0;
   const hunting = ai.goal === 'hunt' && see;
@@ -2658,11 +2666,12 @@ function updateCpu(p, dt) {
     let spd = L.speed;
     if (ai.goal === 'home') spd = Math.min(spd, 40 + 0.9 * (ai.wp.left + wd));         // come in slowly so the pad grabs
     else if (ai.goal === 'crate' || ai.goal === 'lurk') spd = Math.min(spd, 90 + 1.2 * (ai.wp.left + wd));
+    if (careless) spd *= 1.35;
     dvx = wx / wd * spd; dvy = wy / wd * spd;
   }
   // 2) hazards: rock ahead along the current drift, black holes, armed mines
-  for (const t of [0.12, 0.25, 0.4]) {
-    const s = sample(p.x + p.vx * t, p.y + p.vy * t);
+  if (!careless) for (const t of [0.12, 0.25, 0.4]) {
+    const s = sample(p.x + p.vx * t * L.look, p.y + p.vy * t * L.look);
     if (s.v > 0.42) { const g = Math.hypot(s.gx, s.gy) || 1; dvx -= s.gx / g * 420; dvy -= s.gy / g * 420; break; }
   }
   for (const h of holes) {
@@ -2691,7 +2700,8 @@ function updateCpu(p, dt) {
       if (disc >= 0 && Math.abs(a) > 1e-6) { const t1 = (-b - Math.sqrt(disc)) / (2 * a), t2 = (-b + Math.sqrt(disc)) / (2 * a); t = Math.max(0, t1 > 0 ? t1 : t2); }
       t = Math.min(t, 2);
     }
-    ai.err = Math.max(-L.aimErr, Math.min(L.aimErr, ai.err + (Math.random() - 0.5) * dt * 6 * L.aimErr));
+    if ((ai.errT -= dt) <= 0) { ai.errT = 0.25 + Math.random() * 0.6; ai.errTo = (Math.random() * 2 - 1) * L.aimErr; }
+    ai.err += (ai.errTo - ai.err) * Math.min(1, dt * 6);
     aimA = Math.atan2(dy + (o.vy - p.vy) * L.lead * t, dx + (o.vx - p.vx) * L.lead * t) + ai.err;
   }
 
@@ -2706,7 +2716,7 @@ function updateCpu(p, dt) {
   if (aimA !== null && am < 170 && !(ai.reloading && gunOnly)) { wantA = aimA; thrust = am > 45 && Math.cos(moveA - p.a) > 0.8; }
   else thrust = am > 35 && Math.abs(wrap(moveA - p.a)) < 0.5;
   const da = wrap(wantA - p.a);
-  if (da > 0.035) K.right = true; else if (da < -0.035) K.left = true;
+  if (da > L.slop) K.right = true; else if (da < -L.slop) K.left = true;
   K.thrust = thrust;
 
   // unstick: barely moving away from the pad for a while -> push off from the nearest rock
@@ -2717,7 +2727,7 @@ function updateCpu(p, dt) {
   // 5) fire when the gun lines up (after a reaction delay)
   if (aimA !== null && ai.seen > L.react) {
     const flame = p.flame > 0 && (p.prim === 'flame' || !(p.laser > 0)), laser = !flame && p.laser > 0;
-    const err = Math.abs(wrap(aimA - p.a)), range = flame ? cfg.flameRange + 10 : laser ? 2000 : 720;
+    const err = Math.abs(wrap(aimA - p.a)), range = flame ? cfg.flameRange + 10 : laser ? L.range * 1.5 : L.range;
     const want = dist < range && err < L.fireTol * (laser ? 0.6 : 1) * (dist < 150 ? 2 : 1);
     K.fire = laser ? want && !ai.lastFire && p.laserCd <= 0 : want && !(ai.reloading && !flame);   // the laser fires once per press
   }
