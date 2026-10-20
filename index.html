@@ -31,6 +31,16 @@ canvas#game{outline:none}
 #pause .card{text-align:center;display:grid;gap:14px;padding:28px 32px}
 #pause h1{font-family:var(--display);font-weight:700;font-size:44px;letter-spacing:.18em;margin:0;color:var(--ship)}
 #pause .keys{display:flex;gap:8px;justify-content:center;flex-wrap:wrap}
+#start .modes{display:flex;gap:10px;justify-content:center;flex-wrap:wrap}
+#start .seg{display:inline-flex;background:rgba(255,255,255,.07);border-radius:5px;padding:3px;gap:2px}
+#start .seg button{font:600 13px var(--display);letter-spacing:.08em;color:#a9b6c2;background:none;border:0;border-radius:3px;padding:7px 14px;cursor:pointer}
+#start .seg button:hover{color:var(--ship)}
+#start .seg button[aria-pressed=true]{background:var(--mineral);color:#0b1013}
+#start .seg button:focus-visible{outline:2px solid var(--ship);outline-offset:1px}
+#start.pvp .seg.lv{display:none}
+#start .cpuNote{display:none;font-size:12px;opacity:.7}
+#start.cpu .p2 .key{display:none}
+#start.cpu .p2 .cpuNote{display:block}
 #start .credits{margin-top:6px;font-size:12px;opacity:.75;display:grid;gap:4px}
 #start .credits p{margin:0;line-height:1.4}
 #start .credits a{color:var(--ship);text-decoration:underline;text-underline-offset:3px;cursor:pointer}
@@ -94,6 +104,18 @@ canvas#game{outline:none}
         <span class="key"><b>↑</b> thrust</span>
         <span class="key"><b>Enter</b>, <b>,</b> or <b>R-Shift</b> fire</span>
         <span class="key"><b>↓</b> mine / missile / shield</span>
+        <span class="cpuNote">Flown by the computer</span>
+      </div>
+    </div>
+    <div class="modes">
+      <div class="seg" role="group" aria-label="Game mode">
+        <button type="button" data-mode="pvp">2 Players</button>
+        <button type="button" data-mode="cpu">vs CPU</button>
+      </div>
+      <div class="seg lv" role="group" aria-label="CPU difficulty">
+        <button type="button" data-level="0">Easy</button>
+        <button type="button" data-level="1">Normal</button>
+        <button type="button" data-level="2">Hard</button>
       </div>
     </div>
     <div class="keys">
@@ -697,10 +719,10 @@ const PLAYERS = [
 ];
 const down = new Set();                         // physical keys currently held
 const ships = PLAYERS.map((def, id) => ({ id, def, base: null, score: 0, deaths: 0, bumps: 0, safe: { x: 0, y: 0 } }));
-const held = (p, action) => !winner && p.def.keys[action].some(c => down.has(c));
+const held = (p, action) => !winner && (p.ai ? p.ai.keys[action] : p.def.keys[action].some(c => down.has(c)));
 // fresh key presses, kept until the game reads them, so a tap shorter than a frame is never lost
 const taps = new Set();
-const tapped = (p, action) => { let hit = false; for (const c of p.def.keys[action]) if (taps.delete(c)) hit = true; return hit && !winner; };
+const tapped = (p, action) => { if (p.ai) return false; let hit = false; for (const c of p.def.keys[action]) if (taps.delete(c)) hit = true; return hit && !winner; };
 let parts = [], debris = [], bullets = [], chips = [];
 let killMsg = '', killMsgT = 0;
 let winner = null, winT = 0;       // set when someone reaches cfg.winScore; a new cave starts when winT runs out
@@ -1185,6 +1207,7 @@ function newCave(s, keepTheme) {
   farLayers = buildFarLayers(seed);
   placeHoles(seed);
   placeTurrets();
+  buildNav();
   resetMatch();
 }
 
@@ -1743,7 +1766,7 @@ function blastWall(x, y) {
     d[k + 3] = a;
   }
   cctx.putImageData(img, bx + CAVE_PAD, by + CAVE_PAD);
-  miniCanvas = buildMini();
+  miniCanvas = buildMini(); navDirty = true;
   // debris: chips taken from the destroyed pixels, thrown out from the blast
   const n = Math.min(gfx.blastChips, lost.length);
   for (let i = 0; i < n; i++) {
@@ -2487,7 +2510,242 @@ function updateParts(dt) {
   }
   parts = parts.filter(p => p.life > 0);
 }
+// ---------- CPU opponent ----------
+// In "vs CPU" mode Player 2 is flown by this pilot. It never touches the physics: every step it only decides
+// which of P2's keys are held (left / right / thrust / fire / mine), so it flies, docks, fights and uses
+// power-ups by exactly the same rules as a human.
+//  · navigation: a 16 px grid of cells the whole ship fits through; a breadth-first flood from the goal gives
+//    every cell its step count, and the pilot heads for the furthest cell down that route it can see clearly
+//  · flight: no brakes, so it steers by the difference between the velocity it wants and the one it has,
+//    looks ahead for rock, and keeps clear of black holes and armed mines
+//  · combat: leads its shots, holds a stand-off distance and circles, uses missiles / mines / shield
+//  · goals: hunt the opponent, fetch crates, go home to repair when the hull is low
+const CPU_LEVELS = [
+  { name: 'Easy',   react: 0.5,  aimErr: 0.16, fireTol: 0.16, lead: 0.35, speed: 250, think: 0.4,  items: 0.45, retreat: 0.22 },
+  { name: 'Normal', react: 0.25, aimErr: 0.07, fireTol: 0.1,  lead: 0.8,  speed: 340, think: 0.25, items: 0.85, retreat: 0.33 },
+  { name: 'Hard',   react: 0.1,  aimErr: 0.025, fireTol: 0.07, lead: 1,    speed: 440, think: 0.15, items: 1,    retreat: 0.4 },
+];
+let gameMode = 'pvp', cpuLevel = 1;
+try {
+  gameMode = localStorage.getItem('cave-flight-mode') === 'cpu' ? 'cpu' : 'pvp';
+  const lv = localStorage.getItem('cave-flight-cpu'); if (lv !== null) cpuLevel = Math.min(2, Math.max(0, +lv | 0));
+} catch (e) {}
+const newAi = () => ({ keys: { left: false, right: false, thrust: false, fire: false, mine: false }, thinkT: 0, wpT: 0, wp: null,
+  goal: 'hunt', tx: 0, ty: 0, seen: 0, err: 0, orbit: Math.random() < 0.5 ? 1 : -1, orbitT: 3, secCd: 1, shieldT: 0, lastFire: false, stuckT: 0 });
+
+const NAV = 16, NDX = [1, -1, 0, 0, 1, 1, -1, -1], NDY = [0, 0, 1, -1, 1, -1, 1, -1];
+let navW = 0, navH = 0, navOpen = null, navDist = null, navQ = null, navDirty = false;
+function buildNav() {
+  navW = Math.ceil(W / NAV); navH = Math.ceil(H / NAV);
+  navOpen = new Uint8Array(navW * navH); navDist = new Int32Array(navW * navH); navQ = new Int32Array(navW * navH);
+  const r = SHIP_R + 7;
+  for (let cy = 0; cy < navH; cy++) for (let cx = 0; cx < navW; cx++) {
+    const x = cx * NAV + NAV / 2, y = cy * NAV + NAV / 2;
+    let ok = sample(x, y).v < 0.5;
+    for (let k = 0; k < 8 && ok; k++) if (sample(x + Math.cos(k * 0.785) * r, y + Math.sin(k * 0.785) * r).v >= 0.5) ok = false;
+    navOpen[cy * navW + cx] = ok ? 1 : 0;
+  }
+  navDirty = false;
+}
+function navCell(x, y) {                     // nearest open cell to (x, y), searching a few rings out
+  const cx = Math.floor(x / NAV), cy = Math.floor(y / NAV);
+  for (let r = 0; r <= 6; r++) for (let j = -r; j <= r; j++) for (let i = -r; i <= r; i++) {
+    if (Math.max(Math.abs(i), Math.abs(j)) !== r) continue;
+    const X = cx + i, Y = cy + j;
+    if (X >= 0 && Y >= 0 && X < navW && Y < navH && navOpen[Y * navW + X]) return Y * navW + X;
+  }
+  return -1;
+}
+const navX = k => (k % navW) * NAV + NAV / 2, navY = k => ((k / navW) | 0) * NAV + NAV / 2;
+function navField(tx, ty) {                  // flood from the goal: navDist = steps to it, -1 = no route
+  navDist.fill(-1);
+  const t = navCell(tx, ty); if (t < 0) return false;
+  const hs = holes.filter(h => h.s > 0.2).map(h => [h.x, h.y, (HOLE_R * h.s + 34) ** 2]);
+  let head = 0, tail = 0; navDist[t] = 0; navQ[tail++] = t;
+  while (head < tail) {
+    const k = navQ[head++], x = k % navW, y = (k / navW) | 0, d = navDist[k] + 1;
+    for (let j = 0; j < 8; j++) {
+      const X = x + NDX[j], Y = y + NDY[j];
+      if (X < 0 || Y < 0 || X >= navW || Y >= navH) continue;
+      const i = Y * navW + X;
+      if (!navOpen[i] || navDist[i] >= 0) continue;
+      if (j >= 4 && (!navOpen[y * navW + X] || !navOpen[Y * navW + x])) continue;   // no cutting corners
+      const px = X * NAV + NAV / 2, py = Y * NAV + NAV / 2;
+      if (hs.some(([hx, hy, r2]) => (px - hx) ** 2 + (py - hy) ** 2 < r2)) continue;   // route around black holes
+      navDist[i] = d; navQ[tail++] = i;
+    }
+  }
+  return true;
+}
+function wideClear(x0, y0, x1, y1) {         // a clear corridor the width of the ship
+  const d = Math.hypot(x1 - x0, y1 - y0) || 1, nx = -(y1 - y0) / d * (SHIP_R + 2), ny = (x1 - x0) / d * (SHIP_R + 2);
+  return clearLine(x0, y0, x1, y1) && clearLine(x0 + nx, y0 + ny, x1 + nx, y1 + ny) && clearLine(x0 - nx, y0 - ny, x1 - nx, y1 - ny);
+}
+function navWaypoint(p) {                    // furthest point down the route that is in clear view
+  let k = navCell(p.x, p.y);
+  if (k < 0 || navDist[k] < 0) return null;
+  let best = null, first = null;
+  for (let step = 0; step < 50 && navDist[k] > 0; step++) {
+    const x = k % navW, y = (k / navW) | 0;
+    let nk = -1, nd = navDist[k];
+    for (let j = 0; j < 8; j++) {
+      const X = x + NDX[j], Y = y + NDY[j];
+      if (X < 0 || Y < 0 || X >= navW || Y >= navH) continue;
+      const i = Y * navW + X;
+      if (navDist[i] >= 0 && navDist[i] < nd) { nd = navDist[i]; nk = i; }
+    }
+    if (nk < 0) break;
+    k = nk;
+    const pt = { x: navX(k), y: navY(k), end: navDist[k] === 0, left: navDist[k] * NAV };
+    if (!first) first = pt;
+    if (step % 2 === 0 || pt.end) { if (wideClear(p.x, p.y, pt.x, pt.y)) best = pt; else if (best) break; }
+  }
+  return best || first;
+}
+
+function cpuThink(p, o, L, see) {
+  const ai = p.ai, z = dockZone(p.base);
+  let goal = 'hunt', tx = o.x, ty = o.y;
+  const dO = Math.hypot(o.x - p.x, o.y - p.y);
+  if (p.hp < cfg.maxHealth * L.retreat || (o.dead && p.hp < cfg.maxHealth * 0.9)) { goal = 'home'; tx = z.x; ty = z.y; }
+  else {
+    let c = null, dc = Infinity;
+    for (const k of crates) { const d = Math.hypot(k.x - p.x, k.y - p.y); if (d < dc) { dc = d; c = k; } }
+    if (c && (o.dead || (!see && dc < dO * 1.1) || dc < 260)) { goal = 'crate'; tx = c.x; ty = c.y; }
+    else if (o.dead) { goal = 'home'; tx = z.x; ty = z.y; }
+  }
+  const T = turrets.find(t => t.owner === o.id);
+  if (goal === 'hunt' && T && cfg.turretRange > 0 && Math.hypot(o.x - T.x, o.y - T.y) < cfg.turretRange + 60) {
+    // the opponent is sheltering under its turret: wait just outside the turret's reach instead of diving in
+    const d = Math.hypot(p.x - T.x, p.y - T.y) || 1;
+    if (d < cfg.turretRange + 220) { goal = 'lurk'; tx = T.x + (p.x - T.x) / d * (cfg.turretRange + 180); ty = T.y + (p.y - T.y) / d * (cfg.turretRange + 180); }
+  }
+  ai.goal = goal; ai.tx = tx; ai.ty = ty;
+  if (navDirty) buildNav();
+  navField(tx, ty);
+  ai.wp = navWaypoint(p); ai.wpT = 0.1;
+}
+
+function updateCpu(p, dt) {
+  const ai = p.ai, K = ai.keys, L = CPU_LEVELS[cpuLevel], o = ships[1 - p.id];
+  K.left = K.right = K.thrust = K.fire = K.mine = false;
+  if (p.dead || winner || !navOpen) { ai.seen = 0; return; }
+  const dx = o.x - p.x, dy = o.y - p.y, dist = Math.hypot(dx, dy) || 1;
+  const see = !o.dead && dist < 950 && clearLine(p.x, p.y, o.x, o.y);
+  ai.seen = see ? ai.seen + dt : 0;
+
+  if (p.dock) {                              // on the pad: repair, then leave (sooner if hunted and still healthy)
+    if (p.dock === 'docked') {
+      const full = p.hp >= cfg.maxHealth * 0.98, healthy = p.hp > cfg.maxHealth * 0.6;
+      if (full || (healthy && see && dist < 420)) K.thrust = true;
+    }
+    ai.thinkT = 0; return;
+  }
+  if ((ai.thinkT -= dt) <= 0) { ai.thinkT = L.think * (0.8 + Math.random() * 0.4); cpuThink(p, o, L, see); }
+  else if ((ai.wpT -= dt) <= 0) { ai.wp = navWaypoint(p); ai.wpT = 0.1; }
+  if ((ai.orbitT -= dt) <= 0) { ai.orbitT = 2 + Math.random() * 3; if (Math.random() < 0.5) ai.orbit = -ai.orbit; }
+
+  // 1) the velocity it would like to have
+  let dvx = 0, dvy = 0;
+  const hunting = ai.goal === 'hunt' && see;
+  if (hunting) {                             // dogfight: keep a stand-off distance and circle
+    const want = p.flame > 0 && p.prim === 'flame' ? cfg.flameRange * 0.6 : 300;
+    const ux = dx / dist, uy = dy / dist, radial = Math.max(-1, Math.min(1, (dist - want) / 220));
+    dvx = ux * radial * L.speed * 0.85 - uy * ai.orbit * 130;
+    dvy = uy * radial * L.speed * 0.85 + ux * ai.orbit * 130;
+  } else if (ai.wp) {
+    const wx = ai.wp.x - p.x, wy = ai.wp.y - p.y, wd = Math.hypot(wx, wy) || 1;
+    let spd = L.speed;
+    if (ai.goal === 'home') spd = Math.min(spd, 40 + 0.9 * (ai.wp.left + wd));         // come in slowly so the pad grabs
+    else if (ai.goal === 'crate' || ai.goal === 'lurk') spd = Math.min(spd, 90 + 1.2 * (ai.wp.left + wd));
+    dvx = wx / wd * spd; dvy = wy / wd * spd;
+  }
+  // 2) hazards: rock ahead along the current drift, black holes, armed mines
+  for (const t of [0.12, 0.25, 0.4]) {
+    const s = sample(p.x + p.vx * t, p.y + p.vy * t);
+    if (s.v > 0.42) { const g = Math.hypot(s.gx, s.gy) || 1; dvx -= s.gx / g * 420; dvy -= s.gy / g * 420; break; }
+  }
+  for (const h of holes) {
+    const hx = p.x - h.x, hy = p.y - h.y, d = Math.hypot(hx, hy) || 1, R = HOLE_PULL_R * h.s + 50;
+    if (d < R) { dvx += hx / d * 520 * (1 - d / R); dvy += hy / d * 520 * (1 - d / R); }
+  }
+  for (const T of turrets) {                 // keep out of the enemy turret's reach
+    if (T.owner === p.id || cfg.turretRange <= 0) continue;
+    const tx = p.x - T.x, ty = p.y - T.y, d = Math.hypot(tx, ty) || 1, R = cfg.turretRange + 70;
+    if (d < R && clearLine(T.x, T.y, p.x, p.y)) { dvx += tx / d * 650 * (1 - d / R) + tx / d * 120; dvy += ty / d * 650 * (1 - d / R) + ty / d * 120; }
+  }
+  for (const m of mineList) {
+    if (m.arm > 0) continue;
+    const mx = p.x - m.x, my = p.y - m.y, d = Math.hypot(mx, my) || 1;
+    if (d < 170) { dvx += mx / d * 360 * (1 - d / 170); dvy += my / d * 360 * (1 - d / 170); }
+  }
+
+  // 3) aim: lead the target (bullets carry the shooter's velocity, so solve in the shooter's frame)
+  let aimA = null;
+  if (see) {
+    const laser = p.laser > 0 && !(p.flame > 0 && p.prim === 'flame');
+    let t = 0;
+    if (!laser) {
+      const ux = (o.vx - p.vx) * L.lead, uy = (o.vy - p.vy) * L.lead, bs = cfg.bulletSpeed;
+      const a = ux * ux + uy * uy - bs * bs, b = 2 * (dx * ux + dy * uy), c = dx * dx + dy * dy, disc = b * b - 4 * a * c;
+      if (disc >= 0 && Math.abs(a) > 1e-6) { const t1 = (-b - Math.sqrt(disc)) / (2 * a), t2 = (-b + Math.sqrt(disc)) / (2 * a); t = Math.max(0, t1 > 0 ? t1 : t2); }
+      t = Math.min(t, 2);
+    }
+    ai.err = Math.max(-L.aimErr, Math.min(L.aimErr, ai.err + (Math.random() - 0.5) * dt * 6 * L.aimErr));
+    aimA = Math.atan2(dy + (o.vy - p.vy) * L.lead * t, dx + (o.vx - p.vx) * L.lead * t) + ai.err;
+  }
+
+  // 4) turn and thrust: correct the velocity when it is badly off, otherwise point the gun
+  const ax = dvx - p.vx, ay = dvy - p.vy, am = Math.hypot(ax, ay), moveA = Math.atan2(ay, ax);
+  const wrap = a => Math.atan2(Math.sin(a), Math.cos(a));
+  // the gun only reloads while the trigger is released: empty -> let go and reposition until mostly full again
+  if (p.burstLeft <= 0) ai.reloading = true;
+  else if (p.burstLeft >= Math.min(BURST, 7)) ai.reloading = false;
+  const gunOnly = !(p.laser > 0) && !(p.flame > 0);
+  let wantA = moveA, thrust = false;
+  if (aimA !== null && am < 170 && !(ai.reloading && gunOnly)) { wantA = aimA; thrust = am > 45 && Math.cos(moveA - p.a) > 0.8; }
+  else thrust = am > 35 && Math.abs(wrap(moveA - p.a)) < 0.5;
+  const da = wrap(wantA - p.a);
+  if (da > 0.035) K.right = true; else if (da < -0.035) K.left = true;
+  K.thrust = thrust;
+
+  // unstick: barely moving away from the pad for a while -> push off from the nearest rock
+  const sp = Math.hypot(p.vx, p.vy);
+  ai.stuckT = sp < 25 && !hunting ? ai.stuckT + dt : 0;
+  if (ai.stuckT > 1.5) { K.thrust = true; if (ai.stuckT > 2.5) ai.stuckT = 0; }
+
+  // 5) fire when the gun lines up (after a reaction delay)
+  if (aimA !== null && ai.seen > L.react) {
+    const flame = p.flame > 0 && (p.prim === 'flame' || !(p.laser > 0)), laser = !flame && p.laser > 0;
+    const err = Math.abs(wrap(aimA - p.a)), range = flame ? cfg.flameRange + 10 : laser ? 2000 : 720;
+    const want = dist < range && err < L.fireTol * (laser ? 0.6 : 1) * (dist < 150 ? 2 : 1);
+    K.fire = laser ? want && !ai.lastFire && p.laserCd <= 0 : want && !(ai.reloading && !flame);   // the laser fires once per press
+  }
+  ai.lastFire = K.fire;
+
+  // 6) secondary: shield against incoming fire, missiles at range, mines behind it when chased
+  const sec = secondaryOf(p);
+  ai.secCd -= dt; ai.shieldT -= dt;
+  if (sec === 'shield') {
+    if (ai.shieldT <= 0 && ai.secCd <= 0) {
+      const threat = missiles.some(m => m.owner !== p.id && Math.hypot(m.x - p.x, m.y - p.y) < 170)
+        || bullets.some(b => b.owner !== p.id && Math.hypot(b.x - p.x, b.y - p.y) < 70 && (b.x - p.x) * (b.vx - p.vx) + (b.y - p.y) * (b.vy - p.vy) < 0)
+        || (sp > 320 && sample(p.x + p.vx * 0.12, p.y + p.vy * 0.12).v > 0.45);
+      if (threat) { if (Math.random() < L.items) ai.shieldT = 0.7; else ai.secCd = 0.6; }
+    }
+    K.mine = ai.shieldT > 0;
+  } else if (ai.secCd <= 0 && Math.random() < L.items) {
+    if (sec === 'missile' && see && dist < cfg.homingRange * 1.4 && dist > 140) { K.mine = true; ai.secCd = 1.4; }
+    else if (sec === 'mine' && !o.dead && dist < 330) {
+      const behind = Math.abs(wrap(Math.atan2(dy, dx) - p.a)) > 2.1;
+      const tail = sample(p.x - Math.cos(p.a) * 28, p.y - Math.sin(p.a) * 28).v < 0.45;   // never drop it into rock
+      if (behind && tail) { K.mine = true; ai.secCd = 1.6; }
+    }
+  }
+}
+
 function update(dt) {
+  for (const p of ships) if (p.ai) updateCpu(p, dt);
   for (const p of ships) updateShip(p, dt);
   updateTurrets(dt);
   shipsCollide();
@@ -2695,9 +2953,15 @@ function render(t) {
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.fillStyle = '#000'; ctx.fillRect(0, 0, vw, vh);
   const half = Math.floor(vw / 2);
-  renderView(ships[0], 0, half - 1, t);
-  renderView(ships[1], half + 1, vw - half - 1, t);
-  drawShared(half);
+  if (gameMode === 'cpu') {                  // one pilot: the whole screen is P1's view, the CPU's gauges on the right
+    renderView(ships[0], 0, vw, t);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0); drawViewHud(ships[1], vw);
+    drawShared(half, true);
+  } else {
+    renderView(ships[0], 0, half - 1, t);
+    renderView(ships[1], half + 1, vw - half - 1, t);
+    drawShared(half);
+  }
 }
 
 const poly = pts => { ctx.beginPath(); pts.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)); ctx.closePath(); ctx.fill(); };
@@ -2958,9 +3222,10 @@ function drawViewHud(p, w) {
   ctx.textBaseline = 'top';
   ctx.font = '700 18px Oxanium, system-ui, sans-serif';
   ctx.fillStyle = p.def.hex; ctx.fillText(p.def.name, hx, inset - 2);
+  const nw = ctx.measureText(p.def.name).width;   // name width in its own font, so the status never overlaps it
   ctx.font = '11px "IBM Plex Mono", ui-monospace, monospace';
   const status = p.dead ? 'WRECKED' : p.dock === 'docked' ? (p.hp < cfg.maxHealth ? 'DOCKED · REPAIRING' : 'DOCKED') : p.dock ? 'DOCKING' : 'FLYING';
-  ctx.fillStyle = '#c7d3de'; ctx.fillText(status, hx + 34, inset + 3);
+  ctx.fillStyle = '#c7d3de'; ctx.fillText(status, hx + Math.max(34, nw + 10), inset + 3);
 
   const rows = [['SPEED', (spd | 0) + ' px/s'], ['WRECKS', String(p.deaths)], ['POWER-UP', [p.flame > 0 ? 'FLAME' : '', p.shield > 0 ? 'SHIELD' : '', p.laser > 0 ? 'LASER ' + Math.ceil(p.laser) + 's' : '', p.triple > 0 ? 'TRIPLE ' + Math.ceil(p.triple) + 's' : '', p.missiles > 0 ? 'MISSILES ' + p.missiles : '', p.mines > 0 ? 'MINES ' + p.mines : ''].filter(Boolean).join(' \u00b7 ') || '\u2014']];
   rows.forEach(([k, v], i) => { const y = inset + 26 + i * 16; ctx.fillStyle = '#7d8c99'; ctx.fillText(k, hx, y); ctx.fillStyle = '#c7d3de'; ctx.fillText(v, hx + 64, y); });
@@ -3000,24 +3265,25 @@ function drawViewHud(p, w) {
     ctx.fillStyle = p.burning ? '#fff3c4' : '#ff9a3c'; ctx.fillRect(hx + 64, fy + 3, 76 * f, 7);
     if (p.flame > cfg.flameFuel) { ctx.fillStyle = '#c7d3de'; ctx.fillText('×' + (p.flame / cfg.flameFuel).toFixed(1), hx + 146, fy); }
   }
-  const hw = ctx.measureText(p.def.hint).width;
+  const hint = p.ai ? `COMPUTER PILOT · ${CPU_LEVELS[cpuLevel].name.toUpperCase()}` : p.def.hint;
+  const hw = ctx.measureText(hint).width;
   ctx.fillStyle = 'rgba(22,24,24,.82)'; ctx.fillRect(p.id === 0 ? inset - 6 : w - inset - hw - 6, vh - inset - 17, hw + 12, 22);
   ctx.fillStyle = '#8fa3b6';
   ctx.textAlign = p.id === 0 ? 'left' : 'right';
-  ctx.fillText(p.def.hint, p.id === 0 ? inset : w - inset, vh - inset - 12);
+  ctx.fillText(hint, p.id === 0 ? inset : w - inset, vh - inset - 12);
   ctx.textAlign = 'left';
 }
 
 // scoreboard and minimap straddle the split
-function drawShared(half) {
-  ctx.fillStyle = '#000'; ctx.fillRect(half - 1, 0, 2, vh);
+function drawShared(half, single) {
+  if (!single) { ctx.fillStyle = '#000'; ctx.fillRect(half - 1, 0, 2, vh); }
 
   const cx = half;
   ctx.fillStyle = 'rgba(16,18,18,.9)'; ctx.fillRect(cx - 86, 10, 172, 40);
   ctx.textBaseline = 'middle'; ctx.textAlign = 'center';
   ctx.font = '700 11px Oxanium, system-ui, sans-serif';
   ctx.fillStyle = PLAYERS[0].hex; ctx.fillText('P1', cx - 64, 30);
-  ctx.fillStyle = PLAYERS[1].hex; ctx.fillText('P2', cx + 64, 30);
+  ctx.fillStyle = PLAYERS[1].hex; ctx.fillText(PLAYERS[1].name, cx + 64, 30);
   ctx.font = '700 24px Oxanium, system-ui, sans-serif';
   ctx.fillStyle = PLAYERS[0].hex; ctx.fillText(String(ships[0].score), cx - 28, 31);
   ctx.fillStyle = '#5d6f80'; ctx.fillText(':', cx, 30);
@@ -3035,7 +3301,7 @@ function drawShared(half) {
     ctx.fillStyle = winner.def.hex; ctx.fillRect(0, by, vw, 4); ctx.fillRect(0, by + bh - 4, vw, 4);
     ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
     ctx.font = '700 46px Oxanium, system-ui, sans-serif'; ctx.fillStyle = winner.def.hex;
-    ctx.fillText(`PLAYER ${winner.id + 1} WINS`, cx, by + 50);
+    ctx.fillText(winner.ai ? 'CPU WINS' : `PLAYER ${winner.id + 1} WINS`, cx, by + 50);
     ctx.font = '13px "IBM Plex Mono", ui-monospace, monospace'; ctx.fillStyle = '#c7d3de';
     ctx.fillText(`${ships[0].score} : ${ships[1].score}   ·   new cave in ${Math.max(1, Math.ceil(winT))}`, cx, by + 94);
     ctx.textBaseline = 'alphabetic';
@@ -3048,7 +3314,7 @@ function drawShared(half) {
   ctx.fillStyle = 'rgba(16,18,18,.9)'; ctx.fillRect(cx - tw2 / 2, my - 17, tw2, 17);
   ctx.fillStyle = gfx.rock1; ctx.fillText(tl, cx, my - 4);
   ctx.drawImage(miniCanvas, mx, my);
-  const sc = mw / W, halfW = half - 1;
+  const sc = mw / W, halfW = single ? vw : half - 1;
   ctx.save(); ctx.beginPath(); ctx.rect(mx, my, mw, mh); ctx.clip();
   for (const p of ships) {
     ctx.fillStyle = `rgba(${p.def.rgb},.16)`;
@@ -3059,7 +3325,7 @@ function drawShared(half) {
   for (const b of bases) { ctx.fillStyle = PLAYERS[b.owner].hex; ctx.fillRect(mx + b.x * sc - 3, my + b.y * sc - 1, 6, 2); }
   for (const p of ships) if (!p.dead) { ctx.fillStyle = p.def.hex; ctx.fillRect(mx + p.x * sc - 1.5, my + p.y * sc - 1.5, 3, 3); }
   ctx.font = '10px "IBM Plex Mono", ui-monospace, monospace'; ctx.textBaseline = 'top';
-  const kl = 'P pause · Esc title · R new cave · M music · T tuning · Y graphics · B backdrop · L sounds · N mute · 1–7 / ⇧1–7 test power-ups', kw = ctx.measureText(kl).width;
+  const kl = 'P pause · Esc title · M music · N mute · R new cave · T Y L B panels', kw = ctx.measureText(kl).width;
   ctx.fillStyle = 'rgba(16,18,18,.9)'; ctx.fillRect(cx - kw / 2 - 6, my + mh, kw + 12, 17);
   ctx.fillStyle = '#8fa3b6'; ctx.fillText(kl, cx, my + mh + 4);
   ctx.textAlign = 'left';
@@ -3096,7 +3362,28 @@ window.addEventListener('blur', () => down.clear());
 
 const startEl = document.getElementById('start');
 function begin() { sfx.init(); if (running) return; running = true; startEl.hidden = true; cv.focus(); }
-startEl.addEventListener('click', e => { if (e.target.closest('a')) return; begin(); });   // credit links open without launching
+startEl.addEventListener('click', e => {
+  const b = e.target.closest('button');
+  if (b) {                                   // mode / difficulty buttons pick, they don't launch
+    if (b.dataset.mode) gameMode = b.dataset.mode;
+    if (b.dataset.level) cpuLevel = +b.dataset.level;
+    try { localStorage.setItem('cave-flight-mode', gameMode); localStorage.setItem('cave-flight-cpu', String(cpuLevel)); } catch (err) {}
+    applyMode(); return;
+  }
+  if (e.target.closest('a')) return;         // credit links open without launching
+  begin();
+});
+// vs CPU: P2 gets a computer pilot (and the name CPU); 2 Players: both ships on the keyboard
+function applyMode() {
+  const cpu = gameMode === 'cpu';
+  ships[1].ai = cpu ? (ships[1].ai || newAi()) : null;
+  PLAYERS[1].name = cpu ? 'CPU' : 'P2';
+  startEl.classList.toggle('cpu', cpu); startEl.classList.toggle('pvp', !cpu);
+  startEl.querySelector('.p2 h2').textContent = cpu ? 'CPU' : 'P2';
+  startEl.querySelectorAll('[data-mode]').forEach(b => b.setAttribute('aria-pressed', String(b.dataset.mode === gameMode)));
+  startEl.querySelectorAll('[data-level]').forEach(b => b.setAttribute('aria-pressed', String(+b.dataset.level === cpuLevel)));
+}
+applyMode();
 // Esc: abandon the match and go back to the title card; a fresh cave and 0 : 0 wait behind it
 // P: freeze the match (simulation, ship sounds, music) behind a pause card, with a two-tone blip each way.
 // The game also pauses itself when the window loses focus.

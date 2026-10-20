@@ -4,7 +4,7 @@ A two-player, split-screen cave shooter that runs in the browser — one self-co
 
 **Play:** open `index.html` in a desktop browser (or the GitHub Pages link, once enabled).
 
-Two pilots, one cave. Shoot each other down: every wreck scores a point for the other side. No brakes, walls bite, and backing onto your own pad docks you for repairs. First to 5 wins, then a new cave is generated.
+Two pilots, one cave — play a friend on the same keyboard, or pick **vs CPU** on the title screen (Easy / Normal / Hard). Shoot each other down: every wreck scores a point for the other side. No brakes, walls bite, and backing onto your own pad docks you for repairs. First to 5 wins, then a new cave is generated.
 
 ## Controls
 
