@@ -3010,7 +3010,14 @@ function renderView(p, ox, w, t) {
 
   const P = CAVE_PAD, x0 = Math.max(-P, Math.floor(camX)), y0 = Math.max(-P, Math.floor(camY));
   const x1 = Math.min(W + P, Math.ceil(camX + w)), y1 = Math.min(H + P, Math.ceil(camY + vh));
-  if (camX < -P || camY < -P || camX + w > W + P || camY + vh > H + P) { ctx.fillStyle = gfx.rock3; ctx.fillRect(0, 0, w, vh); }   // beyond the padding too
+  {                                          // beyond the rock padding: deep-rock colour, only on the strips outside it
+    const L = -P - camX, T = -P - camY, R = W + P - camX, B = H + P - camY;
+    ctx.fillStyle = gfx.rock3;
+    if (L > 0) ctx.fillRect(0, 0, L, vh);
+    if (R < w) ctx.fillRect(R, 0, w - R, vh);
+    if (T > 0) ctx.fillRect(0, 0, w, T);
+    if (B < vh) ctx.fillRect(0, B, w, vh - B);
+  }
   if (x1 > x0 && y1 > y0) ctx.drawImage(caveCanvas, x0 + P, y0 + P, x1 - x0, y1 - y0, x0 - camX, y0 - camY, x1 - x0, y1 - y0);
 
   // loose rock chips knocked off the walls
