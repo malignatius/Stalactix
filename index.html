@@ -2927,7 +2927,11 @@ let farLayers = [];
 function buildFarLayers(s) {
   const rng = mulberry32(s ^ 0x51ed27);
   return FAR.map(L => {
-    const x0 = -500, x1 = W * L.f + 1500, y0 = -400, y1 = H * L.f + 1100;
+    // cover every view the camera can produce: layer x = camX * f + screen x, with camX anywhere from -viewW/2 to
+    // W - viewW/2 (plus the rock padding), for views up to 4096 x 2560 px - a full-width view on a big screen included
+    const MW = 4096, MH = 2560;
+    const x0 = -(MW / 2 + CAVE_PAD) * L.f - 200, x1 = (W + CAVE_PAD) * L.f + MW + 200;
+    const y0 = -(MH / 2 + CAVE_PAD) * L.f - 200, y1 = (H + CAVE_PAD) * L.f + MH + 200;
     const count = Math.round((x1 - x0) * (y1 - y0) / L.dens), shapes = [];
     for (let i = 0; i < count; i++) {
       const cx = x0 + rng() * (x1 - x0), cy = y0 + rng() * (y1 - y0);
